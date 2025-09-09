@@ -28,7 +28,8 @@ VOXEL_SIZE = 0.01
 WORKSPACE_MASK_PATH = '/home/sd/LangSAM_GraspNet_VLM_Demo/LangRes/mask.png'
 
 # 相机内参（使用深度相机参数生成点云，根据实际相机修改）
-DEPTH_INTR = {"ppx": 328.978, "ppy": 233.791, "fx": 597.462, "fy": 597.592}
+# DEPTH_INTR = {"ppx": 328.978, "ppy": 233.791, "fx": 597.462, "fy": 597.592} #realsense
+DEPTH_INTR = {"ppx": 639.35, "ppy": 397.71, "fx": 611.173, "fy": 611.173}
 DEPTH_FACTOR = 1000.0  # 深度因子，根据实际数据调整
 
 # ==================== 网络加载 ====================
@@ -92,8 +93,8 @@ def get_and_process_data(color_path, depth_path, mask_path):
     print("相机参数预设尺寸:", (1280, 720))
 
     camera = CameraInfo(
-        width=640,
-        height=480,
+        width=1280,
+        height=800,
         fx=DEPTH_INTR['fx'],
         fy=DEPTH_INTR['fy'],
         cx=DEPTH_INTR['ppx'],
@@ -224,7 +225,7 @@ def run_grasp_inference(color_path, depth_path, sam_mask_path=None):
             u_int = int(round(u))
             v_int = int(round(v))
             # 检查投影点是否在图像范围内（640x480）
-            if u_int < 0 or u_int >= 640 or v_int < 0 or v_int >= 480:
+            if u_int < 0 or u_int >= 1280 or v_int < 0 or v_int >= 800:
                 continue
             # 若 SAM 掩码中该像素有效（非0），则保留
             if sam_mask[v_int, u_int] > 0:
@@ -239,7 +240,7 @@ def run_grasp_inference(color_path, depth_path, sam_mask_path=None):
     filtered.sort(key=lambda g: g.score, reverse=True)
 
     # 取前50个抓取（如果少于50个，则全部使用）；此处示例中取前 1 个
-    top_grasps = filtered[:1]
+    top_grasps = filtered[:5]
 
     # 可视化过滤后的抓取，手动转换为 Open3D 物体
     grippers = [g.to_open3d_geometry() for g in top_grasps]
