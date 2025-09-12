@@ -61,57 +61,77 @@ def make_chessboard_object_points(cols, rows, square_mm):
     return objp  # (N,3) in meters
 
 
-def get_end_pose_data(piper):
+def get_end_pose_data(piper, pos_unit_raw="mm", ang_unit_raw="deg"):
     """
     仅获取机械臂末端位姿数据，不打印
 
     Args:
         piper: C_PiperInterface_V2对象
+        pos_unit_raw: 机械臂回报的“原始位置单位”（"mm" 或 "um"）
+        ang_unit_raw: 机械臂回报的“原始角度单位”（"deg" 或 "mdeg"）
 
     Returns:
-        tuple: (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg) 六个位姿数据
+        tuple: (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg) 六个位姿数据（统一换算为 mm / deg）
     """
     end_pose_msg = piper.GetArmEndPoseMsgs()
 
-    x_mm = end_pose_msg.end_pose.X_axis / 1000.0
-    y_mm = end_pose_msg.end_pose.Y_axis / 1000.0
-    z_mm = end_pose_msg.end_pose.Z_axis / 1000.0
-    rx_deg = end_pose_msg.end_pose.RX_axis / 1000.0
-    ry_deg = end_pose_msg.end_pose.RY_axis / 1000.0
-    rz_deg = end_pose_msg.end_pose.RZ_axis / 1000.0
+    # 原始单位 → 统一为 mm / deg（根据控制器真实回报单位切换）
+    x_raw = end_pose_msg.end_pose.X_axis
+    y_raw = end_pose_msg.end_pose.Y_axis
+    z_raw = end_pose_msg.end_pose.Z_axis
+    rx_raw = end_pose_msg.end_pose.RX_axis
+    ry_raw = end_pose_msg.end_pose.RY_axis
+    rz_raw = end_pose_msg.end_pose.RZ_axis
+
+    # 位置：支持 "mm" 或 "um"
+    x_mm = (x_raw / 1000.0) if pos_unit_raw == "um" else float(x_raw)
+    y_mm = (y_raw / 1000.0) if pos_unit_raw == "um" else float(y_raw)
+    z_mm = (z_raw / 1000.0) if pos_unit_raw == "um" else float(z_raw)
+
+    # 角度：支持 "deg" 或 "mdeg"
+    rx_deg = (rx_raw / 1000.0) if ang_unit_raw == "mdeg" else float(rx_raw)
+    ry_deg = (ry_raw / 1000.0) if ang_unit_raw == "mdeg" else float(ry_raw)
+    rz_deg = (rz_raw / 1000.0) if ang_unit_raw == "mdeg" else float(rz_raw)
 
     return x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg
+
 # ---------- 机械臂位姿读取（需按你的 SDK 返回进行适配） ----------
-def get_ee_pose_from_sdk(piper: C_PiperInterface_V2):
+def get_ee_pose_from_sdk(piper: C_PiperInterface_V2,
+                         pos_unit_raw="mm", ang_unit_raw="deg", euler_order="XYZ"):
     """
     返回 T_base_ee 齐次矩阵（单位：米；姿态由度→旋转矩阵）。
     参考：piper_read_end_pose.py 的示例用法（GetArmEndPoseMsgs）。你需要根据实际返回值结构适配解析。
+    euler_order: 控制器欧拉角顺序，支持 "XYZ" / "ZYX"
     """
     msg = piper.GetArmEndPoseMsgs()  # 例如可能返回 dict 或列表/元组
     # 解析 msg，提取位姿数据（单位：mm / deg）
-    X,Y,Z,RX,RY,RZ = get_end_pose_data(piper)
+    X,Y,Z,RX,RY,RZ = get_end_pose_data(piper, pos_unit_raw, ang_unit_raw)
     print("[DEBUG] 机械臂末端位姿（mm/deg）:", f"X={X:.1f}, Y={Y:.1f}, Z={Z:.1f}, RX={RX:.1f}, RY={RY:.1f}, RZ={RZ:.1f}")
 
     # 单位换算：mm -> m；deg -> rad -> R
     p = np.array([X, Y, Z], dtype=np.float64) / 1000.0
     r = np.radians([RX, RY, RZ])
-    # XYZ 固定角
-    cx, cy, cz = np.cos(r); sx, sy, sz = np.sin(r)
-    Rz = np.array([[np.cos(r[2]), -np.sin(r[2]), 0],
-                   [np.sin(r[2]),  np.cos(r[2]), 0],
-                   [0, 0, 1]])
-    Ry = np.array([[np.cos(r[1]), 0, np.sin(r[1])],
-                   [0, 1, 0],
-                   [-np.sin(r[1]), 0, np.cos(r[1])]])
+
+    # 欧拉固定角（与控制器欧拉约定需一致）：支持 XYZ / ZYX
     Rx = np.array([[1, 0, 0],
                    [0, np.cos(r[0]), -np.sin(r[0])],
                    [0, np.sin(r[0]),  np.cos(r[0])]])
-    R = Rz @ Ry @ Rx  # 与控制器欧拉约定需一致
+    Ry = np.array([[np.cos(r[1]), 0, np.sin(r[1])],
+                   [0, 1, 0],
+                   [-np.sin(r[1]), 0, np.cos(r[1])]])
+    Rz = np.array([[np.cos(r[2]), -np.sin(r[2]), 0],
+                   [np.sin(r[2]),  np.cos(r[2]), 0],
+                   [0, 0, 1]])
+    if str(euler_order).upper() == "XYZ":
+        R = Rx @ Ry @ Rz
+    else:  # "ZYX"
+        R = Rz @ Ry @ Rx
+
     T = np.eye(4); T[:3,:3] = R; T[:3,3] = p
     return T
 
 # ---------- 相机棋盘姿态估计 ----------
-def detect_chessboard_pose(color_bgr, cols, rows, square_mm, K, dist):
+def detect_chessboard_pose(color_bgr, cols, rows, square_mm, K, dist, reproj_thresh=0.4):
     """返回 (ok, T_cam_board)。失败返回 (False, None)。单位：米。"""
     gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
     pattern_size = (cols, rows)  # 列×行（内角点数）
@@ -125,6 +145,7 @@ def detect_chessboard_pose(color_bgr, cols, rows, square_mm, K, dist):
         0  # 无标志
     ]
 
+    ok = False
     corners = None
     for flags in flag_combinations:
         ok, corners = cv2.findChessboardCorners(gray, pattern_size, flags)
@@ -152,7 +173,7 @@ def detect_chessboard_pose(color_bgr, cols, rows, square_mm, K, dist):
 
     proj, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
     reproj = np.mean(np.linalg.norm(proj.squeeze() - corners.squeeze(), axis=1))
-    if reproj > 0.4:
+    if reproj > reproj_thresh:
         print(f"[DROP] reproj={reproj:.3f}px");
         return False, None
     T_cam_board = rvec_tvec_to_T(rvec, tvec)
@@ -227,7 +248,9 @@ def run_capture(args):
             continue
 
         vis = color_bgr.copy()
-        ok, T_cam_board = detect_chessboard_pose(color_bgr, args.cols, args.rows, args.square_mm, K, dist_coeffs)
+        ok, T_cam_board = detect_chessboard_pose(
+            color_bgr, args.cols, args.rows, args.square_mm, K, dist_coeffs, args.reproj_thresh
+        )
         if ok:
             # 可视化角点
             pattern_size = (args.cols, args.rows)
@@ -244,8 +267,8 @@ def run_capture(args):
         if key == ord('q'):
             break
         if key == 32 and ok:  # SPACE
-            # 读取 EE 位姿
-            T_base_ee = get_ee_pose_from_sdk(piper)
+            # 读取 EE 位姿（根据原始单位与欧拉顺序转换）
+            T_base_ee = get_ee_pose_from_sdk(piper, args.pos_unit_raw, args.ang_unit_raw, args.euler_order)
             # 保存样本
             sample = {
                 "T_cam_board": T_cam_board.tolist(),
@@ -279,6 +302,9 @@ def run_solve(args):
     R_target2cam,  t_target2cam  = [], []
     for s in D["samples"]:
         T_cam_board = np.array(s["T_cam_board"], dtype=np.float64)
+        # 可选：若数据中保存的是 T_board_cam，这里取逆
+        if args.invert_cam_board:
+            T_cam_board = np.linalg.inv(T_cam_board)
         T_base_ee   = np.array(s["T_base_ee"],   dtype=np.float64)
         R_target2cam.append(T_cam_board[:3,:3])
         t_target2cam.append(T_cam_board[:3, 3].reshape(3,1))
@@ -320,6 +346,8 @@ def run_verify(args):
     pos_errs, ang_errs = [], []
     for s in D["samples"]:
         T_cam_board = np.array(s["T_cam_board"], dtype=np.float64)
+        if args.invert_cam_board:
+            T_cam_board = np.linalg.inv(T_cam_board)
         T_base_ee   = np.array(s["T_base_ee"],   dtype=np.float64)
 
         # 用解出的外参把“相机看到的板”变到基座系：
@@ -346,22 +374,35 @@ def main():
 
     ap_cap = sub.add_parser("capture", help="采集数据样本")
     ap_cap.add_argument("--out", type=str, default="./handeye_run", help="输出目录")
-    ap_cap.add_argument("--cols", type=int, default=6, help="棋盘内角点 列数（例如 10）")
-    ap_cap.add_argument("--rows", type=int, default=8, help="棋盘内角点 行数（例如 7）")
+    ap_cap.add_argument("--cols", type=int, default=5, help="棋盘内角点 列数（例如 10）")
+    ap_cap.add_argument("--rows", type=int, default=7, help="棋盘内角点 行数（例如 7）")
     ap_cap.add_argument("--square-mm", dest="square_mm", type=float, default=25.0, help="每格边长（mm）")
     ap_cap.add_argument("--width", type=int, default=1280)
     ap_cap.add_argument("--height", type=int, default=800)
     ap_cap.add_argument("--fps", type=int, default=30)
+    # 新增：单位/欧拉/重投影阈值
+    ap_cap.add_argument("--pos-unit-raw", choices=["mm","um"], default="mm",
+                        help="机械臂回报的位置原始单位（mm 或 um）")
+    ap_cap.add_argument("--ang-unit-raw", choices=["deg","mdeg"], default="deg",
+                        help="机械臂回报的角度原始单位（deg 或 mdeg）")
+    ap_cap.add_argument("--euler-order", choices=["XYZ","ZYX"], default="XYZ",
+                        help="控制器的欧拉角顺序（固定角），常见 XYZ 或 ZYX")
+    ap_cap.add_argument("--reproj-thresh", type=float, default=0.4,
+                        help="采样阶段的重投影误差阈值（像素），超过将丢弃该样本")
     ap_cap.set_defaults(func=run_capture)
 
     ap_sol = sub.add_parser("solve", help="求解手眼外参")
     ap_sol.add_argument("--data", type=str, default="./handeye_dataset.json", help="handeye_dataset.json 路径")
     ap_sol.add_argument("--out",  type=str, default="./handeye_calib.json", help="输出外参 JSON 路径")
+    ap_sol.add_argument("--invert-cam-board", action="store_true",
+                        help="若数据中保存的是 T_board_cam，则开启该开关在求解/验证时取逆")
     ap_sol.set_defaults(func=run_solve)
 
     ap_ver = sub.add_parser("verify", help="验证求解结果")
     ap_ver.add_argument("--data",  type=str, default="./handeye_dataset.json", help="handeye_dataset.json 路径")
     ap_ver.add_argument("--calib", type=str, default="./handeye_calib.json", help="handeye_calib.json 路径")
+    ap_ver.add_argument("--invert-cam-board", action="store_true",
+                        help="与 --invert-cam-board 一致，验证阶段是否对 T_cam_board 取逆")
     ap_ver.set_defaults(func=run_verify)
 
     args = ap.parse_args()
