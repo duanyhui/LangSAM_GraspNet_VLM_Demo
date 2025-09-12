@@ -2,17 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-handeye_pipeline.py  (修复 & 函数化版本)
+handeye_pipeline.py  （修复 & 函数化版本，保持采集逻辑不变）
 
-功能（函数调用）：
-  - capture_handeye(...)  采集多组样本（相机检测棋盘 + 读取机械臂 EE 位姿），保存数据集 JSON
-  - solve_handeye(...)    使用 OpenCV Robot-World/Hand-Eye 求解，支持 eye_to_hand / eye_in_hand
-  - verify_handeye(...)   按所选安装模式做几何一致性验证（位置/角度误差）
+提供函数：
+  - capture_handeye(...): 交互式采集，写入 {out}/handeye_dataset.json
+  - solve_handeye(...):   调用 OpenCV Robot-World/Hand-Eye，并**按语义求逆后存储**外参
+  - verify_handeye(...):  按 mode 自动选择等式，输出位置/角度误差
 
-与原脚本的不同：
-  - 不再用 argparse/子命令；改为直接函数调用
-  - 采集逻辑（窗口/按键/阈值/相机接口）保持不变
-  - 修复：calibrateRobotWorldHandEye 的入参顺序与方向、输出语义匹配、verify 等式与模式一致
+关键修复点：
+  1) calibrateRobotWorldHandEye 的输出 ^wT_b、^cT_g 现在**按模式正确求逆**后保存为:
+       - eye_to_hand:  T_base_cam = (^bT_c),  T_ee_board = (^eT_t)
+       - eye_in_hand:  T_base_world = (^bT_w), T_gripper_cam = (^gT_c)
+  2) 验证等式与模式严格一致
+  3) Piper 姿态支持 rot_repr="euler" / "rodrigues"
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ def T_to_rt(T):
 def make_chessboard_object_points(cols, rows, square_mm):
     """内角点坐标（单位 m；z=0）"""
     objp = np.zeros((rows*cols, 3), np.float32)
-    grid = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)  # 列优先
+    grid = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)  # 列优先；与 findChessboardCorners 返回顺序匹配
     objp[:,:2] = grid * (square_mm / 1000.0)
     return objp
 
@@ -53,29 +55,21 @@ def inv_T(T):
     Ti[:3,3]  = -R.T @ t
     return Ti
 
-def average_rotations(R_list):
-    """用SVD做最近正交投影的旋转平均"""
-    M = np.zeros((3,3), dtype=np.float64)
-    for R in R_list:
-        M += R
-    U, _, Vt = np.linalg.svd(M)
-    R_avg = U @ Vt
-    if np.linalg.det(R_avg) < 0:
-        U[:, -1] *= -1
-        R_avg = U @ Vt
-    return R_avg
-
 def se3_from_Rt(R, t):
     T = np.eye(4, dtype=np.float64)
     T[:3,:3] = R
     T[:3, 3] = t.reshape(3)
     return T
 
+def rot_angle_deg_from_R(R):
+    """旋转误差角（deg）"""
+    tr = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+    return float(abs(np.degrees(np.arccos(tr))))
+
 # ---------------- Piper 末端位姿读取 ----------------
 def get_end_pose_data(piper, pos_unit_raw="mm", ang_unit_raw="deg"):
     """
-    仅获取机械臂末端位姿数据，不打印
-    返回六元组（mm/deg）
+    从 Piper SDK 读取 X,Y,Z,RX,RY,RZ（原始单位），统一换算到 mm/deg。
     """
     end_pose_msg = piper.GetArmEndPoseMsgs()
     x_raw = end_pose_msg.end_pose.X_axis
@@ -88,37 +82,51 @@ def get_end_pose_data(piper, pos_unit_raw="mm", ang_unit_raw="deg"):
     x_mm = (x_raw / 1000.0) if pos_unit_raw == "um"  else float(x_raw)
     y_mm = (y_raw / 1000.0) if pos_unit_raw == "um"  else float(y_raw)
     z_mm = (z_raw / 1000.0) if pos_unit_raw == "um"  else float(z_raw)
-    rx_deg = (rx_raw / 1000.0) if ang_unit_raw == "mdeg" else float(rx_raw)
-    ry_deg = (ry_raw / 1000.0) if ang_unit_raw == "mdeg" else float(ry_raw)
-    rz_deg = (rz_raw / 1000.0) if ang_unit_raw == "mdeg" else float(rz_raw)
+
+    if ang_unit_raw == "mdeg":
+        rx_deg, ry_deg, rz_deg = rx_raw/1000.0, ry_raw/1000.0, rz_raw/1000.0
+    else:
+        rx_deg, ry_deg, rz_deg = float(rx_raw), float(ry_raw), float(rz_raw)
 
     return x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg
 
 def get_ee_pose_from_sdk(piper: C_PiperInterface_V2,
-                         pos_unit_raw="mm", ang_unit_raw="deg", euler_order="XYZ"):
+                         pos_unit_raw="mm",
+                         ang_unit_raw="deg",
+                         euler_order="XYZ",
+                         rot_repr="euler"):
     """
-    返回 T_base_ee（单位 m），旋转按控制器欧拉角顺序（XYZ/ZYX）
+    返回 T_base_ee（单位 m）。支持两种姿态表示：
+      - rot_repr="euler":   将 (RX,RY,RZ) 视为欧拉固定角，按 euler_order 组合
+      - rot_repr="rodrigues": 将 (RX,RY,RZ) 视为“旋转向量”(角度制)；先转弧度再 cv2.Rodrigues
+    注意：不同固件/SDK 版本语义可能不同。若验证出现 ~120-180° 的巨大角误差，请尝试 rot_repr="rodrigues"。
     """
     X,Y,Z,RX,RY,RZ = get_end_pose_data(piper, pos_unit_raw, ang_unit_raw)
     print("[DEBUG] 机械臂末端位姿（mm/deg）:",
           f"X={X:.1f}, Y={Y:.1f}, Z={Z:.1f}, RX={RX:.1f}, RY={RY:.1f}, RZ={RZ:.1f}")
 
     p = np.array([X, Y, Z], dtype=np.float64) / 1000.0
-    r = np.radians([RX, RY, RZ])
 
-    Rx = np.array([[1, 0, 0],
-                   [0, np.cos(r[0]), -np.sin(r[0])],
-                   [0, np.sin(r[0]),  np.cos(r[0])]])
-    Ry = np.array([[np.cos(r[1]), 0, np.sin(r[1])],
-                   [0, 1, 0],
-                   [-np.sin(r[1]), 0, np.cos(r[1])]])
-    Rz = np.array([[np.cos(r[2]), -np.sin(r[2]), 0],
-                   [np.sin(r[2]),  np.cos(r[2]), 0],
-                   [0, 0, 1]])
-    if str(euler_order).upper() == "XYZ":
-        R = Rx @ Ry @ Rz
-    else:  # ZYX
-        R = Rz @ Ry @ Rx
+    if rot_repr.lower() == "rodrigues":
+        # 把角度制的旋转向量转成弧度
+        rotvec_rad = np.radians([RX, RY, RZ]).reshape(3,1)
+        R, _ = cv2.Rodrigues(rotvec_rad)
+    else:
+        # 欧拉固定角（XYZ/ZYX）
+        r = np.radians([RX, RY, RZ])
+        Rx = np.array([[1, 0, 0],
+                       [0, np.cos(r[0]), -np.sin(r[0])],
+                       [0, np.sin(r[0]),  np.cos(r[0])]])
+        Ry = np.array([[np.cos(r[1]), 0, np.sin(r[1])],
+                       [0, 1, 0],
+                       [-np.sin(r[1]), 0, np.cos(r[1])]])
+        Rz = np.array([[np.cos(r[2]), -np.sin(r[2]), 0],
+                       [np.sin(r[2]),  np.cos(r[2]), 0],
+                       [0, 0, 1]])
+        if str(euler_order).upper() == "XYZ":
+            R = Rx @ Ry @ Rz
+        else:  # ZYX
+            R = Rz @ Ry @ Rx
 
     T = np.eye(4); T[:3,:3] = R; T[:3,3] = p
     return T
@@ -143,11 +151,9 @@ def detect_chessboard_pose(color_bgr, cols, rows, square_mm, K, dist, reproj_thr
     for flags in flag_combinations:
         ok, corners = cv2.findChessboardCorners(gray, pattern_size, flags)
         if ok:
-            # print(f"[DEBUG] 棋盘格检测成功，flags={flags}, 角点={len(corners)}")
             break
 
     if not ok:
-        # print(f"[DEBUG] 棋盘检测失败，期望 {cols}x{rows}={cols*rows} 个内角点")
         return False, None
 
     term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
@@ -173,6 +179,7 @@ def capture_handeye(out="./handeye_run",
                     cols=7, rows=5, square_mm=25.0,
                     width=1280, height=800, fps=30,
                     pos_unit_raw="mm", ang_unit_raw="deg", euler_order="XYZ",
+                    rot_repr="euler",
                     reproj_thresh=0.4):
     """
     交互式采集：按 SPACE 采样，q 退出。保存 {out}/handeye_dataset.json
@@ -220,7 +227,14 @@ def capture_handeye(out="./handeye_run",
     dataset = {
         "cols": cols, "rows": rows, "square_mm": square_mm,
         "K": K.tolist(), "dist": dist_coeffs.reshape(-1).tolist(),
-        "samples": []
+        "samples": [],
+        "meta": {
+            "pos_unit_raw": pos_unit_raw,
+            "ang_unit_raw": ang_unit_raw,
+            "euler_order": euler_order,
+            "rot_repr": rot_repr,
+            "reproj_thresh": reproj_thresh
+        }
     }
 
     print("\n[CAPTURE] 操作提示：")
@@ -231,7 +245,7 @@ def capture_handeye(out="./handeye_run",
     try:
         while True:
             try:
-                time.sleep(0.1)
+                time.sleep(0.01)
                 cf, df = cam.capture(timeout_ms=3000)
                 color_bgr, _ = cam.frames_to_numpy(cf, df)
             except RuntimeError as e:
@@ -243,11 +257,6 @@ def capture_handeye(out="./handeye_run",
                 color_bgr, cols, rows, square_mm, K, dist_coeffs, reproj_thresh
             )
             if ok:
-                pattern_size = (cols, rows)
-                gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
-                ret, corners = cv2.findChessboardCorners(gray, pattern_size)
-                if ret:
-                    cv2.drawChessboardCorners(vis, pattern_size, corners, ret)
                 cv2.putText(vis, "DETECTED", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,200,0), 2)
             else:
                 cv2.putText(vis, "NOT FOUND", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
@@ -257,7 +266,9 @@ def capture_handeye(out="./handeye_run",
             if key == ord('q'):
                 break
             if key == 32 and ok:  # SPACE
-                T_base_ee = get_ee_pose_from_sdk(piper, pos_unit_raw, ang_unit_raw, euler_order)
+                T_base_ee = get_ee_pose_from_sdk(
+                    piper, pos_unit_raw, ang_unit_raw, euler_order, rot_repr
+                )
                 sample = {
                     "T_cam_board": T_cam_board.tolist(),
                     "T_base_ee": T_base_ee.tolist(),
@@ -278,30 +289,6 @@ def capture_handeye(out="./handeye_run",
     return data_path
 
 # ---------------- 求解 ----------------
-def _build_world2cam_and_base2gripper(D, invert_cam_board_for_world2cam: bool, always_inv_base_ee=True):
-    """
-    按指定策略构造 RobotWorld/HandEye 的两组观测序列：
-    world2cam[], base2gripper[]
-    """
-    R_world2cam, t_world2cam = [], []
-    R_base2gripper, t_base2gripper = [], []
-
-    for s in D["samples"]:
-        T_cam_board = np.array(s["T_cam_board"], dtype=np.float64)
-        T_base_ee   = np.array(s["T_base_ee"],   dtype=np.float64)
-
-        # world2cam: 由 T_cam_board 或其逆得到
-        T_w2c = T_cam_board if not invert_cam_board_for_world2cam else inv_T(T_cam_board)
-        R_world2cam.append(T_w2c[:3,:3])
-        t_world2cam.append(T_w2c[:3,3].reshape(3,1))
-
-        # base2gripper: 一律 inv(T_base_ee)
-        T_b2g = inv_T(T_base_ee) if always_inv_base_ee else T_base_ee
-        R_base2gripper.append(T_b2g[:3,:3])
-        t_base2gripper.append(T_b2g[:3,3].reshape(3,1))
-
-    return R_world2cam, t_world2cam, R_base2gripper, t_base2gripper
-
 def solve_handeye(data_path: str,
                   out_path: str = "./handeye_calib.json",
                   setup: str = "auto",
@@ -309,79 +296,76 @@ def solve_handeye(data_path: str,
     """
     求解与保存标定：
       setup in {"auto","eye_to_hand","eye_in_hand"}
-        - eye_to_hand：外置相机、棋盘固定在夹爪（我们需要 T_base_cam、T_ee_board）
-        - eye_in_hand：相机在末端、棋盘固定在世界（输出 T_base_world、T_gripper_cam）
-        - auto：基于 T_cam_board 的平移方差做粗略判别（> 1 cm 视为相机相对棋盘有明显运动 → eye_in_hand）
+        - eye_to_hand：外置相机、棋盘固定在夹爪（想要 ^bT_c 与 ^eT_t）
+        - eye_in_hand：相机在末端、棋盘固定在世界（想要 ^bT_w 与 ^gT_c）
+      注意：按 OpenCV 语义，输出 ^wT_b 与 ^cT_g 需按模式**求逆后**再保存。
     """
     with open(data_path, "r", encoding="utf-8") as f:
         D = json.load(f)
 
-    # --- 自动模式的简单判别：看 T_cam_board 的平移是否明显变化 ---
     if setup == "auto":
         t_all = [np.array(s["T_cam_board"], dtype=np.float64)[:3,3] for s in D["samples"]]
         if len(t_all) < 3:
-            setup = "eye_to_hand"  # 样本太少，默认外置相机
+            setup = "eye_to_hand"
         else:
-            t_stack = np.stack(t_all, axis=0)
-            std_meter = np.std(t_stack, axis=0)
-            setup = "eye_in_hand" if np.linalg.norm(std_meter) > 0.01 else "eye_to_hand"  # 1 cm 阈值
+            std_meter = np.linalg.norm(np.std(np.stack(t_all, axis=0), axis=0))
+            # 若相机相对棋盘的平移变化明显（>1cm），大概率是 eye_in_hand
+            setup = "eye_in_hand" if std_meter > 0.01 else "eye_to_hand"
         print(f"[AUTO] 判定安装形态：{setup}")
 
-    # --- 构造观测并调用 OpenCV 求解 ---
+    # 组装输入观测
+    R_w2c, t_w2c, R_b2g, t_b2g = [], [], [], []
+    for s in D["samples"]:
+        T_cam_board = np.array(s["T_cam_board"], dtype=np.float64)  # ^cT_t
+        T_base_ee   = np.array(s["T_base_ee"],   dtype=np.float64)  # ^bT_e
+        if setup == "eye_to_hand":
+            # world= camera, cam= board  → ^c' T_w' = ^board T camera = inv(^camera T board)
+            T_w2c = inv_T(T_cam_board)
+        elif setup == "eye_in_hand":
+            # world= board, cam= camera  → ^c T_w = ^camera T board = ^cT_t
+            T_w2c = T_cam_board
+        else:
+            raise ValueError("setup 必须是 {'auto','eye_to_hand','eye_in_hand'}")
+
+        T_b2g = inv_T(T_base_ee)  # ^gT_b
+
+        R_w2c.append(T_w2c[:3,:3]);      t_w2c.append(T_w2c[:3,3].reshape(3,1))
+        R_b2g.append(T_b2g[:3,:3]);      t_b2g.append(T_b2g[:3,3].reshape(3,1))
+
+    if not hasattr(cv2, "calibrateRobotWorldHandEye"):
+        raise RuntimeError("当前 OpenCV 缺少 calibrateRobotWorldHandEye（需要 4.8+）。")
+
+    R_base2world, t_base2world, R_gripper2cam, t_gripper2cam = cv2.calibrateRobotWorldHandEye(
+        R_w2c, t_w2c, R_b2g, t_b2g, method=method
+    )
+    T_wTb = se3_from_Rt(R_base2world, t_base2world)  # ^wT_b
+    T_cTg = se3_from_Rt(R_gripper2cam, t_gripper2cam) # ^cT_g （注意：若上面置换了 cam，这里的 c 就随之改变）
+
+    # —— 关键：按模式把 OpenCV 输出“求逆后”保存成我们需要的量 —— #
     if setup == "eye_to_hand":
-        # 关键：把“world”定义为“camera”、把“cam”定义为“board”
-        # 因此 world2cam[] 应该是 “cam→board”，即 inv(T_cam_board)
-        invert_cam_board_for_world2cam = True   # 用 inv(T_cam_board)
-        R_w2c, t_w2c, R_b2g, t_b2g = _build_world2cam_and_base2gripper(
-            D, invert_cam_board_for_world2cam=True, always_inv_base_ee=True
-        )
-        if not hasattr(cv2, "calibrateRobotWorldHandEye"):
-            raise RuntimeError("OpenCV 缺少 calibrateRobotWorldHandEye（需要 4.8+）")
-
-        R_base2world, t_base2world, R_gripper2cam, t_gripper2cam = cv2.calibrateRobotWorldHandEye(
-            R_w2c, t_w2c, R_b2g, t_b2g, method=method
-        )
-        # 这里的 world == camera, cam == board
-        # 因此：
-        #   base2world == base2camera
-        #   gripper2cam == ee2board
-        T_base_cam = se3_from_Rt(R_base2world, t_base2world)
-        T_ee_board = se3_from_Rt(R_gripper2cam, t_gripper2cam)
-
+        # world'=camera, cam'=board
+        T_base_cam  = inv_T(T_wTb)   # (^bT_c) = inv(^cT_b)
+        T_ee_board  = inv_T(T_cTg)   # (^eT_t) = inv(^tT_e)
         out = {
             "mode": "eye_to_hand",
-            "T_base_cam": T_base_cam.tolist(),
-            "T_ee_board": T_ee_board.tolist(),
+            "T_base_cam":  T_base_cam.tolist(),
+            "T_ee_board":  T_ee_board.tolist(),
             "num_samples": len(D["samples"]),
             "method": int(method),
-            "note": "由 calibrateRobotWorldHandEye 通过（world=cam, cam=board）置换得到"
+            "note": "world=camera, cam=board；已对 ^wT_b 与 ^c'T_g 求逆得到 ^bT_c / ^eT_t"
         }
-
-    elif setup == "eye_in_hand":
-        # 直接按文档语义：world == board, cam == camera
-        invert_cam_board_for_world2cam = False  # 直接用 T_cam_board
-        R_w2c, t_w2c, R_b2g, t_b2g = _build_world2cam_and_base2gripper(
-            D, invert_cam_board_for_world2cam=False, always_inv_base_ee=True
-        )
-        if not hasattr(cv2, "calibrateRobotWorldHandEye"):
-            raise RuntimeError("OpenCV 缺少 calibrateRobotWorldHandEye（需要 4.8+）")
-
-        R_base2world, t_base2world, R_gripper2cam, t_gripper2cam = cv2.calibrateRobotWorldHandEye(
-            R_w2c, t_w2c, R_b2g, t_b2g, method=method
-        )
-        # world == board, cam == camera
-        T_base_world  = se3_from_Rt(R_base2world, t_base2world)   # base->board
-        T_gripper_cam = se3_from_Rt(R_gripper2cam, t_gripper2cam) # ee->cam
-
+    else:
+        # eye_in_hand: world=board, cam=camera
+        T_base_world = inv_T(T_wTb)  # (^bT_w) = inv(^wT_b)
+        T_gripper_cam= inv_T(T_cTg)  # (^gT_c) = inv(^cT_g)
         out = {
             "mode": "eye_in_hand",
             "T_base_world":  T_base_world.tolist(),
             "T_gripper_cam": T_gripper_cam.tolist(),
             "num_samples": len(D["samples"]),
-            "method": int(method)
+            "method": int(method),
+            "note": "world=board, cam=camera；已对 ^wT_b 与 ^cT_g 求逆得到 ^bT_w / ^gT_c"
         }
-    else:
-        raise ValueError("setup 必须是 {'auto','eye_to_hand','eye_in_hand'}")
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
@@ -389,14 +373,10 @@ def solve_handeye(data_path: str,
     return out_path
 
 # ---------------- 验证 ----------------
-def _rot_angle_deg(R):
-    angle = np.degrees(np.arccos(np.clip((np.trace(R)-1)/2.0, -1.0, 1.0)))
-    return float(abs(angle))
-
 def verify_handeye(data_path: str, calib_path: str):
     """
     根据 calib.json 中的 'mode' 字段自动选择校验公式。
-    打印平均/最大 位置(单位 mm)/角度(单位 deg)误差。
+    输出平均/最大 位置(单位 mm)/角度(单位 deg)误差。
     """
     with open(data_path, "r", encoding="utf-8") as f:
         D = json.load(f)
@@ -404,46 +384,44 @@ def verify_handeye(data_path: str, calib_path: str):
         C = json.load(f)
 
     mode = C.get("mode", "eye_to_hand")
-
     pos_errs, ang_errs = [], []
 
     if mode == "eye_to_hand":
-        # 期望恒定：T_base_cam, T_ee_board
-        T_base_cam = np.array(C["T_base_cam"], dtype=np.float64)
-        T_ee_board = np.array(C["T_ee_board"], dtype=np.float64)
+        T_base_cam = np.array(C["T_base_cam"], dtype=np.float64)   # ^bT_c
+        T_ee_board = np.array(C["T_ee_board"], dtype=np.float64)   # ^eT_t
 
         for s in D["samples"]:
-            T_cam_board = np.array(s["T_cam_board"], dtype=np.float64)
-            T_base_ee   = np.array(s["T_base_ee"],   dtype=np.float64)
+            T_cam_board = np.array(s["T_cam_board"], dtype=np.float64)  # ^cT_t
+            T_base_ee   = np.array(s["T_base_ee"],   dtype=np.float64)  # ^bT_e
 
-            # 预测： base<-board
-            T_base_board_pred = T_base_cam @ T_cam_board
-            # “真值”： base<-ee<-board
-            T_base_board_gt   = T_base_ee @ T_ee_board
+            # 预测 base<-board
+            T_pred = T_base_cam @ T_cam_board                 # ^bT_c · ^cT_t = ^bT_t
+            # “真值”
+            T_gt   = T_base_ee @ T_ee_board                   # ^bT_e · ^eT_t = ^bT_t
 
-            dp = T_base_board_pred[:3,3] - T_base_board_gt[:3,3]
+            dp = T_pred[:3,3] - T_gt[:3,3]
             pos_errs.append(np.linalg.norm(dp) * 1000.0)
 
-            dR = T_base_board_pred[:3,:3].T @ T_base_board_gt[:3,:3]
-            ang_errs.append(_rot_angle_deg(dR))
+            dR = T_pred[:3,:3].T @ T_gt[:3,:3]
+            ang_errs.append(rot_angle_deg_from_R(dR))
 
     elif mode == "eye_in_hand":
-        # 期望恒定：T_base_world, T_gripper_cam
-        T_base_world  = np.array(C["T_base_world"],  dtype=np.float64)  # base<-board
-        T_gripper_cam = np.array(C["T_gripper_cam"], dtype=np.float64)  # ee<-cam
+        T_base_world  = np.array(C["T_base_world"],  dtype=np.float64)  # ^bT_w
+        T_gripper_cam = np.array(C["T_gripper_cam"], dtype=np.float64)  # ^gT_c
 
         for s in D["samples"]:
-            T_cam_board = np.array(s["T_cam_board"], dtype=np.float64)  # cam<-board
-            T_base_ee   = np.array(s["T_base_ee"],   dtype=np.float64)  # base<-ee
+            T_cam_board = np.array(s["T_cam_board"], dtype=np.float64)  # ^cT_w (w=t=board)
+            T_base_ee   = np.array(s["T_base_ee"],   dtype=np.float64)  # ^bT_e
 
-            # 预测： base<-world ≈ (base<-ee) * (ee<-cam) * (cam<-board)
-            T_base_world_pred = (T_base_ee @ T_gripper_cam) @ T_cam_board
+            # 预测 base<-world
+            T_pred = (T_base_ee @ T_gripper_cam) @ T_cam_board          # ^bT_e · ^gT_c · ^cT_w = ^bT_w
+            T_gt   = T_base_world
 
-            dp = T_base_world_pred[:3,3] - T_base_world[:3,3]
+            dp = T_pred[:3,3] - T_gt[:3,3]
             pos_errs.append(np.linalg.norm(dp) * 1000.0)
 
-            dR = T_base_world_pred[:3,:3].T @ T_base_world[:3,:3]
-            ang_errs.append(_rot_angle_deg(dR))
+            dR = T_pred[:3,:3].T @ T_gt[:3,:3]
+            ang_errs.append(rot_angle_deg_from_R(dR))
     else:
         raise ValueError("calib['mode'] 必须是 {'eye_to_hand','eye_in_hand'}")
 
@@ -459,18 +437,18 @@ def verify_handeye(data_path: str, calib_path: str):
     }
 
 if __name__ == "__main__":
-    # 示例调用
-    # 1) 采集（与原参数一致）
+    # 示例：使用函数（不再依赖命令行）
     data_path = capture_handeye(
-        out="run5",
+        out="run7",
         cols=7, rows=5, square_mm=25,
         pos_unit_raw="um", ang_unit_raw="mdeg",
-        euler_order="ZXY",
+        euler_order="XYZ",
+        rot_repr="euler",          # 若误差依旧呈 100°+，改为 "rodrigues"
         reproj_thresh=0.4
     )
     calib_path = solve_handeye(
-        data_path="run5/handeye_dataset.json",
+        data_path=data_path,
         out_path="handeye_calib.json",
-        setup="eye_to_hand"  # 或 "eye_in_hand" 或 "auto"
+        setup="eye_to_hand"        # 或 "eye_in_hand" 或 "auto"
     )
-    verify_handeye("run5/handeye_dataset.json", "handeye_calib.json")
+    verify_handeye(data_path, calib_path)
